@@ -147,16 +147,21 @@ async function main() {
   const isHoliday = makeIsHoliday(holidayInfo.dateSet);
 
   // --- タスク読み込み ---
-  let tasks;
+  let taskData;
   try {
-    tasks = await readTasksFromExcel(inputPath);
+    taskData = await readTasksFromExcel(inputPath);
   } catch (err) {
     console.error('\nエラー: ' + err.message);
     process.exit(1);
   }
+  const { tasks, columnOrder, hasProgressColumn } = taskData;
   console.log(`タスクを${tasks.length}件読み込みました。`);
+  if (!hasProgressColumn) {
+    console.log('(「進捗」列が見つからなかったため、全タスク進捗0%として出力します)');
+  }
 
   // --- スケジューリング ---
+  const today = todayDate();
   let scheduled;
   try {
     scheduled = scheduleTasks(tasks, projectStart, isHoliday);
@@ -179,6 +184,9 @@ async function main() {
     isHoliday,
     outputPath,
     projectStart,
+    today,
+    columnOrder,
+    hasProgressColumn,
   });
 
   console.log('\n=== 完了 ===');
@@ -187,7 +195,7 @@ async function main() {
   for (const t of scheduled) {
     const s = `${t.startDate.getFullYear()}/${t.startDate.getMonth() + 1}/${t.startDate.getDate()}`;
     const e = `${t.endDate.getFullYear()}/${t.endDate.getMonth() + 1}/${t.endDate.getDate()}`;
-    console.log(`  [${t.assignee}] ${t.name} (${t.days}日): ${s} 〜 ${e}`);
+    console.log(`  [${t.assignee}] ${t.name} (${t.days}日, 進捗${t.progress}%): ${s} 〜 ${e}`);
   }
 }
 

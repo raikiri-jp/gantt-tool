@@ -44,7 +44,8 @@ function firstBusinessDayOnOrAfter(date, isHoliday) {
  * @param {Array} tasks - [{ name, assignee, days, priority, progress, ...other }]
  * @param {Date} projectStart - プロジェクト全体の開始日
  * @param {function} isHoliday - 日付を受け取り休日かどうかを返す関数
- * @returns {Array} スケジュール結果 [{ ...task, startDate, endDate, progress }]
+ * @param {Date} today - 「今日」とみなす日付(遅延判定に使用)
+ * @returns {Array} スケジュール結果 [{ ...task, startDate, endDate, progress, isLate }]
  *
  * ルール:
  * - 依存関係はなし。
@@ -52,9 +53,10 @@ function firstBusinessDayOnOrAfter(date, isHoliday) {
  * - 各タスクは「projectStart」と「その担当者が空く最初の営業日」の
  *   うち遅い方から開始する。
  * - 同一担当者のタスクは重複しない(直列)。別担当者は並行可能。
- * - 進捗は常に保持する(未入力は0%扱い)。
+ * - 進捗は常に保持し(未入力は0%扱い)、完了日が今日より前なのに進捗100%未満なら「遅れ」とする。
+ *   (今日以降に完了予定のタスクは遅れと見なさない)
  */
-function scheduleTasks(tasks, projectStart, isHoliday) {
+function scheduleTasks(tasks, projectStart, isHoliday, today) {
   // 優先順位でソート (小さい数字が先。未指定/NaNは最後、入力順を保持する安定ソート)
   const indexed = tasks.map((t, i) => ({ t, i }));
   indexed.sort((a, b) => {
@@ -65,6 +67,7 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
   });
 
   const projectStartBusiness = firstBusinessDayOnOrAfter(projectStart, isHoliday);
+  const todayNormalized = today ? stripTime(today) : null;
 
   // 担当者ごとの「次に空く日」を管理
   const assigneeNextAvailable = new Map();
@@ -88,12 +91,16 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
     const endDate = addBusinessDays(candidateStart, days, isHoliday);
 
     const progress = normalizedProgress(t.progress);
+    const isLate = todayNormalized
+      ? endDate < todayNormalized && progress < 100
+      : false;
 
     results.push({
       ...t,
       assignee,
       days,
       progress,
+      isLate,
       startDate: candidateStart,
       endDate,
     });
@@ -113,6 +120,10 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
   });
 
   return results;
+}
+
+function stripTime(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
 
 function normalizedPriority(p) {
