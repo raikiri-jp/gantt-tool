@@ -20,6 +20,19 @@ function addDays(date, n) {
 }
 
 /**
+ * ローカルの年/月/日を保ったまま、UTC基準のDateオブジェクトに変換する。
+ *
+ * 背景: `new Date(y, m, d)` はローカルタイムゾーンで0時を表すDateを作るが、
+ * 日本(UTC+9)などでこれをそのままExcelの日付セルに書き込むと、内部的には
+ * UTCに変換されるため「前日の15:00」のような表示になってしまう
+ * (exceljsはDateのUTC値をそのままExcelシリアル値として扱うため)。
+ * Excelに渡す直前に必ずこの関数を通すことで、見た目の年/月/日のズレを防ぐ。
+ */
+function toExcelDate(date) {
+  return new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+}
+
+/**
  * 週の開始日(月曜)を取得する
  */
 function startOfWeekMonday(date) {
@@ -28,6 +41,27 @@ function startOfWeekMonday(date) {
   const diff = dow === 0 ? -6 : 1 - dow;
   d.setDate(d.getDate() + diff);
   return d;
+}
+
+/**
+ * 指定日が属する月の1日を返す。
+ */
+function startOfMonth(date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+
+/**
+ * 指定日が属する月の末日を返す。
+ */
+function endOfMonth(date) {
+  return new Date(date.getFullYear(), date.getMonth() + 1, 0);
+}
+
+/**
+ * 指定日から指定ヶ月後の同日を返す(日付計算用、月末調整はしない単純加算)。
+ */
+function addMonths(date, n) {
+  return new Date(date.getFullYear(), date.getMonth() + n, date.getDate());
 }
 
 /**
@@ -109,8 +143,14 @@ async function buildGanttExcel(scheduledTasks, opts) {
     scheduledTasks[0].endDate
   );
 
-  const timelineStart = granularity === 'week' ? startOfWeekMonday(minStart) : new Date(minStart);
-  const timelineEnd = new Date(maxEnd);
+  // カレンダーは月初〜月末で揺れなく表示し、終了予定の1ヶ月後まで余裕を持たせる。
+  // 週単位の場合は、月初を含む週の月曜日から開始する。
+  const calendarStart = startOfMonth(minStart);
+  const calendarEndTarget = addMonths(maxEnd, 1);
+  const calendarEnd = endOfMonth(calendarEndTarget);
+
+  const timelineStart = granularity === 'week' ? startOfWeekMonday(calendarStart) : calendarStart;
+  const timelineEnd = calendarEnd;
 
   // タイムラインの列見出しリストを作る
   const timelineCols = []; // { date(or weekStart), weekEnd(週単位のみ), isHolidayCol(日単位のみ) }
@@ -160,10 +200,11 @@ async function buildGanttExcel(scheduledTasks, opts) {
       monthGroupStartCol = col;
     }
 
-    // 2行目: 日付(日単位は日のみ表示、週単位はm/d表示) - 日付型のセルにする
+    // 2行目: 日付(日付型のセルにする。日単位は「日」のみ、週単位もこの行は「日」のみ表示し、
+    // 月情報は1行目にまとめる)
     const dateCell = headerRow2.getCell(col);
-    dateCell.value = tc.date;
-    dateCell.numFmt = granularity === 'day' ? 'd' : 'm/d';
+    dateCell.value = toExcelDate(tc.date);
+    dateCell.numFmt = 'd';
 
     // 3行目: 曜日(日単位のみ) - 2行目を参照する数式 + aaa書式
     if (granularity === 'day') {
@@ -224,10 +265,10 @@ async function buildGanttExcel(scheduledTasks, opts) {
       const col = ci + 1;
       const cell = row.getCell(col);
       if (h === '開始日') {
-        cell.value = task.startDate;
+        cell.value = toExcelDate(task.startDate);
         cell.numFmt = 'yyyy/mm/dd';
       } else if (h === '完了日') {
-        cell.value = task.endDate;
+        cell.value = toExcelDate(task.endDate);
         cell.numFmt = 'yyyy/mm/dd';
       } else if (h === '進捗(%)' || h === '進捗') {
         cell.value = task.progress; // 数値(0-100)
@@ -251,8 +292,9 @@ async function buildGanttExcel(scheduledTasks, opts) {
       cell.font = { size: 10 };
     });
 
-    // タイムライン部分: 値は入れず、土日祝のグレー塗り + 今日の枠線のみ直接設定。
-    // バー(開始日〜完了日)の色は後段で条件付き書式として一括設定する。
+    // タイムライン部分: 値は入れず、今日の枠線のみ直接設定。
+    // 休日のグレー塗り・バー(開始日〜完了日)の色は後段で条件付き書式として一括設定する
+    // (休日を優先させるため、休日ルールをバーのルールより先に評価させる)。
     timelineCols.forEach((tc, ci) => {
       const col = FIXED_COL_COUNT + 1 + ci;
       const cell = row.getCell(col);
@@ -263,10 +305,6 @@ async function buildGanttExcel(scheduledTasks, opts) {
           : todayNormalized && todayNormalized >= tc.date && todayNormalized <= tc.weekEnd;
 
       cell.border = isTodayCol ? borderAllColored(COLOR_TODAY_BORDER, 'medium') : borderAll(COLOR_GRID);
-
-      if (granularity === 'day' && tc.isHolidayCol) {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLOR_HOLIDAY_FILL } };
-      }
     });
 
     row.height = 16;
@@ -274,11 +312,6 @@ async function buildGanttExcel(scheduledTasks, opts) {
 
   const dataEndRow = DATA_START_ROW + scheduledTasks.length - 1;
 
-  // --- 条件付き書式: タイムラインのバー(開始日〜完了日)を塗る ---
-  // 数式は「タイムラインのこの列の日付」が「この行の開始日以上、完了日以下」なら塗る。
-  // 日単位: タイムラインの日付セルは headerRow2 (2行目)。
-  // 週単位: タイムラインの週開始日セルは headerRow2 (2行目)。週の場合は
-  //         「週の範囲(開始日〜開始日+6)」とタスク期間が重なっていれば塗る。
   if (timelineCols.length > 0 && scheduledTasks.length > 0) {
     const firstTimelineCol = FIXED_COL_COUNT + 1;
     const lastTimelineCol = FIXED_COL_COUNT + timelineCols.length;
@@ -289,6 +322,38 @@ async function buildGanttExcel(scheduledTasks, opts) {
     const endColLetter = colLetter(endDateCol);
     const firstColLetterTimeline = colLetter(firstTimelineCol);
 
+    // --- 条件付き書式 1: 休日(土日・祝日・年末年始)のグレー塗り ---
+    // 優先度を1(最優先)にし、stopIfTrueでバーのルールより先に評価・確定させる。
+    // これにより「休日に作業しているように見える」ことを防ぐ(休日表示が常に優先される)。
+    // 日単位のみ適用(週単位は1セルが1週間を表すため、休日の概念をそのまま塗りには使わない)。
+    if (granularity === 'day') {
+      timelineCols.forEach((tc, ci) => {
+        if (!tc.isHolidayCol) return;
+        const col = FIXED_COL_COUNT + 1 + ci;
+        const colLet = colLetter(col);
+        const holidayRangeRef = `${colLet}${DATA_START_ROW}:${colLet}${dataEndRow}`;
+        sheet.addConditionalFormatting({
+          ref: holidayRangeRef,
+          rules: [
+            {
+              type: 'expression',
+              priority: 1,
+              stopIfTrue: true,
+              formulae: ['TRUE'],
+              style: {
+                fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: COLOR_HOLIDAY_FILL } },
+              },
+            },
+          ],
+        });
+      });
+    }
+
+    // --- 条件付き書式 2: タイムラインのバー(開始日〜完了日)を塗る ---
+    // 数式は「タイムラインのこの列の日付」が「この行の開始日以上、完了日以下」なら塗る。
+    // 日単位: タイムラインの日付セルは headerRow2 (2行目)。
+    // 週単位: タイムラインの週開始日セルは headerRow2 (2行目)。週の場合は
+    //         「週の範囲(開始日〜開始日+6)」とタスク期間が重なっていれば塗る。
     let formula;
     if (granularity === 'day') {
       // ${firstColLetterTimeline}$2 はタイムライン2行目(日付)。列は相対、行は絶対。
@@ -302,12 +367,14 @@ async function buildGanttExcel(scheduledTasks, opts) {
     // exceljsの条件付き書式は「ref」全体に対して、行頭セル基準の相対参照で評価される。
     // ここでは1行目(DATA_START_ROW)を基準にした数式を使い、ref全体に適用する
     // (Excelの仕様上、相対参照は範囲内で自動的にスライドする)。
+    // priorityを2にして休日ルールより後に評価させる(休日ルールがstopIfTrueのため、
+    // 休日列ではこのルールまで到達しない)。
     sheet.addConditionalFormatting({
       ref: rangeRef,
       rules: [
         {
           type: 'expression',
-          priority: 1,
+          priority: 2,
           formulae: [formula],
           style: {
             fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: COLOR_BAR_NORMAL } },
