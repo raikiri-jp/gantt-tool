@@ -2,12 +2,27 @@
 
 const path = require('path');
 const fs = require('fs');
-const readlineSync = require('readline-sync');
+const readline = require('readline');
 
 const { loadHolidays, makeIsHoliday } = require('./src/holidays');
 const { readTasksFromExcel } = require('./src/readTasks');
 const { scheduleTasks } = require('./src/scheduler');
 const { buildGanttExcel } = require('./src/buildGantt');
+
+/**
+ * 標準入出力で1行の質問をして回答を受け取る。
+ *
+ * readline-syncのような同期入力ライブラリは、Windows環境で内部的に
+ * 別プロセス/別I/O経路を介してプロンプト文字列を出力することがあり、
+ * ターミナルのコードページ設定と噛み合わずに日本語が文字化けすることがある。
+ * Node標準のreadlineモジュールはconsole.logと同じstdout経路を使うため、
+ * 文字化けの問題を避けられる。
+ */
+function ask(rl, promptText) {
+  return new Promise((resolve) => {
+    rl.question(promptText, (answer) => resolve(answer));
+  });
+}
 
 function parseDateInput(str) {
   const s = str.trim();
@@ -76,6 +91,9 @@ async function main() {
   console.log(`入力ファイル(B): ${inputPath}`);
 
   const isInteractive = process.stdin.isTTY === true;
+  const rl = isInteractive
+    ? readline.createInterface({ input: process.stdin, output: process.stdout })
+    : null;
 
   // --- 開始日の決定 ---
   let projectStart = null;
@@ -87,7 +105,8 @@ async function main() {
     }
   } else if (isInteractive) {
     while (!projectStart) {
-      const input = readlineSync.question(
+      const input = await ask(
+        rl,
         'プロジェクト全体の開始日を入力してください (例: 2026-06-20、何も入力しないと今日): '
       );
       if (input.trim() === '') {
@@ -117,7 +136,10 @@ async function main() {
     }
   } else if (isInteractive) {
     while (!granularity) {
-      const input = readlineSync.question('ガントチャートの粒度を選んでください [day=日単位 / week=週単位] (デフォルト: week): ');
+      const input = await ask(
+        rl,
+        'ガントチャートの粒度を選んでください [day=日単位 / week=週単位] (デフォルト: week): '
+      );
       const v = input.trim().toLowerCase();
       if (v === '' || v === 'week' || v === 'w') {
         granularity = 'week';
@@ -132,6 +154,8 @@ async function main() {
     console.log('(非対話実行のため粒度は week を使用します。--granularity で指定できます)');
   }
   console.log(`粒度: ${granularity === 'day' ? '日単位' : '週単位'}`);
+
+  if (rl) rl.close();
 
   // --- 祝日データのロード ---
   let holidayInfo;
