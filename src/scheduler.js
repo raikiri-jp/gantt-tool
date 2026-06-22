@@ -45,14 +45,16 @@ function firstBusinessDayOnOrAfter(date, isHoliday) {
  * @param {Date} projectStart - プロジェクト全体の開始日
  * @param {function} isHoliday - 日付を受け取り休日かどうかを返す関数
  * @returns {Array} スケジュール結果 [{ ...task, startDate, endDate, progress }]
+ *   (Bファイルの行順をそのまま保持して返す)
  *
  * ルール:
  * - 依存関係はなし。
- * - 優先順位(数値が小さいほど優先、同値は入力順)でソートして順に配置する。
+ * - 日程計算は優先順位(数値が小さいほど優先、同値は入力順)の順に行う。
  * - 各タスクは「projectStart」と「その担当者が空く最初の営業日」の
  *   うち遅い方から開始する。
  * - 同一担当者のタスクは重複しない(直列)。別担当者は並行可能。
  * - 進捗は常に保持する(未入力は0%扱い)。
+ * - 戻り値の並び順は、計算順(優先順位順)ではなく、常にBファイルの行順(入力順)。
  */
 function scheduleTasks(tasks, projectStart, isHoliday) {
   // 優先順位でソート (小さい数字が先。未指定/NaNは最後、入力順を保持する安定ソート)
@@ -70,7 +72,7 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
   const assigneeNextAvailable = new Map();
 
   const results = [];
-  for (const { t } of indexed) {
+  for (const { t, i } of indexed) {
     const assignee = (t.assignee || '(未割当)').toString();
     const days = Number(t.days);
     if (!Number.isFinite(days) || days <= 0) {
@@ -96,6 +98,7 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
       progress,
       startDate: candidateStart,
       endDate,
+      __inputIndex: i,
     });
 
     // 担当者の次の空き日は終了日の翌営業日
@@ -103,14 +106,11 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
     assigneeNextAvailable.set(assignee, nextFree);
   }
 
-  // 表示用に元の入力順(または優先順位順)に並べ替えたい場合は呼び出し側で調整可能。
-  // ここでは「開始日順」に並べてガントチャートで見やすくする。
-  results.sort((a, b) => {
-    if (a.startDate.getTime() !== b.startDate.getTime()) {
-      return a.startDate.getTime() - b.startDate.getTime();
-    }
-    return normalizedPriority(a.priority) - normalizedPriority(b.priority);
-  });
+  // 表示順は常にBファイルの行順(入力順)をそのまま保持する。
+  // スケジューリングの計算(優先順位・担当者の空き状況)は内部処理のみに使い、
+  // 出力時の並び順には影響させない。
+  results.sort((a, b) => a.__inputIndex - b.__inputIndex);
+  results.forEach((r) => delete r.__inputIndex);
 
   return results;
 }

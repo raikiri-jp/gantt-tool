@@ -292,19 +292,14 @@ async function buildGanttExcel(scheduledTasks, opts) {
       cell.font = { size: 10 };
     });
 
-    // タイムライン部分: 値は入れず、今日の枠線のみ直接設定。
-    // 休日のグレー塗り・バー(開始日〜完了日)の色は後段で条件付き書式として一括設定する
+    // タイムライン部分: 値は入れない。
+    // 休日のグレー塗り・今日の右側縦線・バー(開始日〜完了日)の色は
+    // すべて後段で条件付き書式として一括設定する
     // (休日を優先させるため、休日ルールをバーのルールより先に評価させる)。
     timelineCols.forEach((tc, ci) => {
       const col = FIXED_COL_COUNT + 1 + ci;
       const cell = row.getCell(col);
-
-      const isTodayCol =
-        granularity === 'day'
-          ? todayNormalized && sameDate(tc.date, todayNormalized)
-          : todayNormalized && todayNormalized >= tc.date && todayNormalized <= tc.weekEnd;
-
-      cell.border = isTodayCol ? borderAllColored(COLOR_TODAY_BORDER, 'medium') : borderAll(COLOR_GRID);
+      cell.border = borderAll(COLOR_GRID);
     });
 
     row.height = 16;
@@ -382,9 +377,37 @@ async function buildGanttExcel(scheduledTasks, opts) {
         },
       ],
     });
-  }
 
-  // 今日の列をヘッダーにも示す(日付の右上に小さく▼マーカーは付けず、枠線のみで表現する)
+    // --- 条件付き書式 3: 今日の列の右側に縦線を引く ---
+    // セル全体を枠で囲むのではなく、右側の縦線のみを引く(列の境界が「今日」であることを示す)。
+    // この列が「今日」かどうかは、タイムラインヘッダーの日付セル(2行目)を基準に判定する。
+    // 日単位: その列の日付が今日と一致する場合。
+    // 週単位: 今日がその週の範囲(開始日〜開始日+6)に含まれる場合。
+    if (todayNormalized) {
+      const todayExcelSerial = toExcelDate(todayNormalized);
+      let todayFormula;
+      if (granularity === 'day') {
+        todayFormula = `${firstColLetterTimeline}$2=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()})`;
+      } else {
+        todayFormula =
+          `AND(${firstColLetterTimeline}$2<=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()}),(${firstColLetterTimeline}$2+6)>=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()}))`;
+      }
+
+      sheet.addConditionalFormatting({
+        ref: rangeRef,
+        rules: [
+          {
+            type: 'expression',
+            priority: 3,
+            formulae: [todayFormula],
+            style: {
+              border: { right: { style: 'medium', color: { argb: COLOR_TODAY_BORDER } } },
+            },
+          },
+        ],
+      });
+    }
+  }
 
   await workbook.xlsx.writeFile(outputPath);
   return outputPath;
@@ -393,15 +416,6 @@ async function buildGanttExcel(scheduledTasks, opts) {
 function borderAll(argb) {
   const style = { style: 'thin', color: { argb } };
   return { top: style, left: style, bottom: style, right: style };
-}
-
-function borderAllColored(argb, weight) {
-  const style = { style: weight, color: { argb } };
-  return { top: style, left: style, bottom: style, right: style };
-}
-
-function sameDate(a, b) {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
 module.exports = { buildGanttExcel };
