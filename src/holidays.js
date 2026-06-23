@@ -128,19 +128,44 @@ function writeCache(holidayList) {
 
 /**
  * キャッシュCSVを読み込む。
+ * 戻り値: [{ date: "YYYY-MM-DD", name: string }]
  */
 function readCache() {
   const cachePath = getCachePath();
   const text = fs.readFileSync(cachePath, 'utf8');
   const lines = text.split(/\r\n|\n|\r/).filter((l) => l.trim().length > 0);
-  const set = new Set();
+  const list = [];
   for (let i = 1; i < lines.length; i++) {
     const idx = lines[i].indexOf(',');
     if (idx === -1) continue;
     const date = lines[i].slice(0, idx).trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) set.add(date);
+    let name = lines[i].slice(idx + 1).trim();
+    // ダブルクオートで囲まれている場合は外す
+    if (name.startsWith('"') && name.endsWith('"')) {
+      name = name.slice(1, -1).replace(/""/g, '"');
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) list.push({ date, name });
   }
-  return set;
+  return list;
+}
+
+/**
+ * 指定した期間(start〜end、両端を含む)に含まれる年末年始休暇(12/27〜1/3)の
+ * 日付一覧を名称付きで生成する。
+ *
+ * @returns {Array<{date: string, name: string}>}
+ */
+function buildYearEndHolidayList(startDate, endDate) {
+  const list = [];
+  let cur = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+  const end = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+  while (cur <= end) {
+    if (isYearEndHoliday(cur)) {
+      list.push({ date: formatYmd(cur), name: '年末年始休暇' });
+    }
+    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1);
+  }
+  return list;
 }
 
 /**
@@ -153,8 +178,9 @@ function readCache() {
 async function loadHolidays() {
   const cachePath = getCachePath();
   if (fs.existsSync(cachePath)) {
-    const dateSet = readCache();
-    return { dateSet, usedCache: true, cachePath };
+    const holidayList = readCache();
+    const dateSet = new Set(holidayList.map((h) => h.date));
+    return { dateSet, holidayList, usedCache: true, cachePath };
   }
 
   console.log('祝日キャッシュが見つかりません。内閣府サイトから祝日データを取得します...');
@@ -177,7 +203,7 @@ async function loadHolidays() {
   console.log(`祝日データを取得しました (${holidayList.length}件)。キャッシュを作成しました: ${cachePath}`);
 
   const dateSet = new Set(holidayList.map((h) => h.date));
-  return { dateSet, usedCache: false, cachePath };
+  return { dateSet, holidayList, usedCache: false, cachePath };
 }
 
 function formatYmd(date) {
@@ -205,6 +231,7 @@ module.exports = {
   makeIsHoliday,
   formatYmd,
   isYearEndHoliday,
+  buildYearEndHolidayList,
   getCachePath,
   CACHE_FILENAME,
   HOLIDAY_CSV_URL,

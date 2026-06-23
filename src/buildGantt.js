@@ -79,6 +79,76 @@ function colLetter(colNum) {
 }
 
 /**
+ * 「担当者」シートを作成する。
+ * 列: 担当者名, 参画開始日。次回Bとして再利用したときに読み込めるようにするため、
+ * Cにも必ず含める。
+ *
+ * @param {ExcelJS.Workbook} workbook
+ * @param {Map<string, Date>} assigneeStartDates - 担当者名 -> 参画開始日
+ * @returns {ExcelJS.Worksheet}
+ */
+function buildAssigneeSheet(workbook, assigneeStartDates) {
+  const sheet = workbook.addWorksheet('担当者');
+  sheet.getColumn(1).width = 16;
+  sheet.getColumn(2).width = 14;
+
+  const headerRow = sheet.getRow(1);
+  headerRow.getCell(1).value = '担当者名';
+  headerRow.getCell(2).value = '参画開始日';
+  headerRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLOR_HEADER_FILL } };
+    cell.font = { color: { argb: COLOR_HEADER_FONT }, bold: true, size: 10 };
+  });
+
+  let rowIdx = 2;
+  for (const [name, startDate] of assigneeStartDates.entries()) {
+    const row = sheet.getRow(rowIdx);
+    row.getCell(1).value = name;
+    const dateCell = row.getCell(2);
+    dateCell.value = toExcelDate(startDate);
+    dateCell.numFmt = 'yyyy/mm/dd';
+    rowIdx++;
+  }
+
+  return sheet;
+}
+
+/**
+ * 「休日」シートを作成する。
+ * 列: 日付, 名称。日付は日付型のセルにする(後続の条件付き書式から参照するため)。
+ *
+ * @param {ExcelJS.Workbook} workbook
+ * @param {Array<{date: Date, name: string}>} holidayRows - 表示する休日一覧(日付昇順でなくても可)
+ * @returns {ExcelJS.Worksheet}
+ */
+function buildHolidaySheet(workbook, holidayRows) {
+  const sheet = workbook.addWorksheet('休日');
+  sheet.getColumn(1).width = 14;
+  sheet.getColumn(2).width = 24;
+
+  const headerRow = sheet.getRow(1);
+  headerRow.getCell(1).value = '日付';
+  headerRow.getCell(2).value = '名称';
+  headerRow.eachCell((cell) => {
+    cell.font = { bold: true, size: 10 };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLOR_HEADER_FILL } };
+    cell.font = { color: { argb: COLOR_HEADER_FONT }, bold: true, size: 10 };
+  });
+
+  // 日付昇順に並べておく(重複は除去しない: 同日に複数の休日名が記録されるケースは稀だが許容)
+  const sorted = [...holidayRows].sort((a, b) => a.date.getTime() - b.date.getTime());
+  sorted.forEach((h, idx) => {
+    const row = sheet.getRow(idx + 2);
+    const dateCell = row.getCell(1);
+    dateCell.value = toExcelDate(h.date);
+    dateCell.numFmt = 'yyyy/mm/dd';
+    row.getCell(2).value = h.name || '';
+  });
+
+  return sheet;
+}
+
+/**
  * ガントチャート付きExcel(C)を生成して保存する。
  *
  * 列構成: Bから読み込んだ全列(columnOrderの順序通り) + 開始日 + 完了日
@@ -86,18 +156,20 @@ function colLetter(colNum) {
  *
  * タイムラインの色塗りは条件付き書式で実現する(開始日・完了日のセルを参照するため、
  * Excel上で開始日・完了日・進捗を編集すればバーの表示も自動的に追従する)。
+ * 休日判定も「休日」シートをCOUNTIFで参照する条件付き書式で行うため、
+ * Excel上で「休日」シートを編集すれば表示が追従する。
  *
  * @param {Array} scheduledTasks - scheduler.scheduleTasks() の戻り値
  * @param {object} opts
  *   opts.granularity: 'day' | 'week'
- *   opts.isHoliday: function(date) => boolean
  *   opts.outputPath: string
- *   opts.today: Date
  *   opts.columnOrder: string[]  Bから読み込んだ全列名(開始日・完了日は含まない)
  *   opts.hasProgressColumn: boolean  Bに進捗列が既にあったか
+ *   opts.holidayRows: Array<{date: Date, name: string}>  「休日」シートに書き出す一覧
+ *   opts.assigneeStartDates: Map<string, Date>  「担当者」シートに書き出す一覧
  */
 async function buildGanttExcel(scheduledTasks, opts) {
-  const { granularity, isHoliday, outputPath, today, columnOrder, hasProgressColumn } = opts;
+  const { granularity, outputPath, columnOrder, hasProgressColumn, holidayRows, assigneeStartDates } = opts;
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'gantt-tool';
@@ -107,6 +179,9 @@ async function buildGanttExcel(scheduledTasks, opts) {
   const HEADER_ROW_COUNT = granularity === 'day' ? 3 : 2;
   const DATA_START_ROW = HEADER_ROW_COUNT + 1;
 
+  // 「ガントチャート」シートを最初に追加する(Excelで開いたときに最初に表示される、
+  // かつCを次回Bとして使うときにシートの並びに依存せず読み込めるようにするため、
+  // readTasks.js側でもシート名で判定しているが、視認性のためにも先頭にしておく)。
   const sheet = workbook.addWorksheet('ガントチャート', {
     views: [{ state: 'frozen', xSplit: columnOrder.length + 2, ySplit: HEADER_ROW_COUNT }],
     pageSetup: {
@@ -118,6 +193,12 @@ async function buildGanttExcel(scheduledTasks, opts) {
       margins: { left: 0.3, right: 0.3, top: 0.3, bottom: 0.3, header: 0.2, footer: 0.2 },
     },
   });
+
+  // 「休日」「担当者」シートを追加する(条件付き書式からシート名で参照する、
+  // および次回Bとして再利用したときに読み込めるようにするため)。
+  const holidaySheet = buildHolidaySheet(workbook, holidayRows || []);
+  const HOLIDAY_SHEET_NAME = holidaySheet.name;
+  buildAssigneeSheet(workbook, assigneeStartDates);
 
   // 固定列見出し = Bの全列(進捗列があれば除く) + 開始日 + 完了日 + 進捗(%)
   // 要件: 「完了日の隣に進捗」なので、進捗列は常に完了日の直後(最後尾)に配置する。
@@ -153,11 +234,11 @@ async function buildGanttExcel(scheduledTasks, opts) {
   const timelineEnd = calendarEnd;
 
   // タイムラインの列見出しリストを作る
-  const timelineCols = []; // { date(or weekStart), weekEnd(週単位のみ), isHolidayCol(日単位のみ) }
+  const timelineCols = []; // { date(or weekStart), weekEnd(週単位のみ) }
   if (granularity === 'day') {
     let cur = new Date(timelineStart);
     while (cur <= timelineEnd) {
-      timelineCols.push({ date: new Date(cur), isHolidayCol: isHoliday(cur) });
+      timelineCols.push({ date: new Date(cur) });
       cur = addDays(cur, 1);
     }
   } else {
@@ -255,7 +336,6 @@ async function buildGanttExcel(scheduledTasks, opts) {
   }
 
   // --- データ行 ---
-  const todayNormalized = today ? new Date(today.getFullYear(), today.getMonth(), today.getDate()) : null;
 
   scheduledTasks.forEach((task, idx) => {
     const rowIdx = DATA_START_ROW + idx;
@@ -317,30 +397,32 @@ async function buildGanttExcel(scheduledTasks, opts) {
     const endColLetter = colLetter(endDateCol);
     const firstColLetterTimeline = colLetter(firstTimelineCol);
 
-    // --- 条件付き書式 1: 休日(土日・祝日・年末年始)のグレー塗り ---
+    // 「休日」シートの日付列を参照するための範囲指定(シートを横断する絶対参照)。
+    // 行数に上限を設けず、シート全体の列Aを参照する(空セルはCOUNTIFで無視される)。
+    const holidaySheetDateRange = `'${HOLIDAY_SHEET_NAME}'!$A$2:$A$100000`;
+
+    // --- 条件付き書式 1: 休日(土日 または「休日」シート掲載日)のグレー塗り ---
+    // WEEKDAY(日付,2) は月=1〜日=7を返すため、6(土)以上なら週末。
+    // COUNTIF(休日シートの日付列, この列の日付) > 0 なら休日シートに載っている日。
     // 優先度を1(最優先)にし、stopIfTrueでバーのルールより先に評価・確定させる。
     // これにより「休日に作業しているように見える」ことを防ぐ(休日表示が常に優先される)。
     // 日単位のみ適用(週単位は1セルが1週間を表すため、休日の概念をそのまま塗りには使わない)。
     if (granularity === 'day') {
-      timelineCols.forEach((tc, ci) => {
-        if (!tc.isHolidayCol) return;
-        const col = FIXED_COL_COUNT + 1 + ci;
-        const colLet = colLetter(col);
-        const holidayRangeRef = `${colLet}${DATA_START_ROW}:${colLet}${dataEndRow}`;
-        sheet.addConditionalFormatting({
-          ref: holidayRangeRef,
-          rules: [
-            {
-              type: 'expression',
-              priority: 1,
-              stopIfTrue: true,
-              formulae: ['TRUE'],
-              style: {
-                fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: COLOR_HOLIDAY_FILL } },
-              },
+      const holidayFormula =
+        `OR(WEEKDAY(${firstColLetterTimeline}$2,2)>=6,COUNTIF(${holidaySheetDateRange},${firstColLetterTimeline}$2)>0)`;
+      sheet.addConditionalFormatting({
+        ref: rangeRef,
+        rules: [
+          {
+            type: 'expression',
+            priority: 1,
+            stopIfTrue: true,
+            formulae: [holidayFormula],
+            style: {
+              fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: COLOR_HOLIDAY_FILL } },
             },
-          ],
-        });
+          },
+        ],
       });
     }
 
@@ -378,35 +460,33 @@ async function buildGanttExcel(scheduledTasks, opts) {
       ],
     });
 
-    // --- 条件付き書式 3: 今日の列の右側に縦線を引く ---
-    // セル全体を枠で囲むのではなく、右側の縦線のみを引く(列の境界が「今日」であることを示す)。
-    // この列が「今日」かどうかは、タイムラインヘッダーの日付セル(2行目)を基準に判定する。
+    // --- 条件付き書式 3: 今日の列の左側に縦線を引く ---
+    // セル全体を枠で囲むのではなく、左側の縦線のみを引く(列の境界が「今日」であることを示す)。
+    // 「今日」はExcelのTODAY()関数で動的に判定するため、ファイルを開いた日に応じて
+    // 自動的に表示位置が変わる(作成日に固定されない)。
     // 日単位: その列の日付が今日と一致する場合。
     // 週単位: 今日がその週の範囲(開始日〜開始日+6)に含まれる場合。
-    if (todayNormalized) {
-      const todayExcelSerial = toExcelDate(todayNormalized);
-      let todayFormula;
-      if (granularity === 'day') {
-        todayFormula = `${firstColLetterTimeline}$2=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()})`;
-      } else {
-        todayFormula =
-          `AND(${firstColLetterTimeline}$2<=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()}),(${firstColLetterTimeline}$2+6)>=DATE(${todayExcelSerial.getUTCFullYear()},${todayExcelSerial.getUTCMonth() + 1},${todayExcelSerial.getUTCDate()}))`;
-      }
-
-      sheet.addConditionalFormatting({
-        ref: rangeRef,
-        rules: [
-          {
-            type: 'expression',
-            priority: 3,
-            formulae: [todayFormula],
-            style: {
-              border: { right: { style: 'medium', color: { argb: COLOR_TODAY_BORDER } } },
-            },
-          },
-        ],
-      });
+    let todayFormula;
+    if (granularity === 'day') {
+      todayFormula = `${firstColLetterTimeline}$2=TODAY()`;
+    } else {
+      todayFormula =
+        `AND(${firstColLetterTimeline}$2<=TODAY(),(${firstColLetterTimeline}$2+6)>=TODAY())`;
     }
+
+    sheet.addConditionalFormatting({
+      ref: rangeRef,
+      rules: [
+        {
+          type: 'expression',
+          priority: 3,
+          formulae: [todayFormula],
+          style: {
+            border: { left: { style: 'medium', color: { argb: COLOR_TODAY_BORDER } } },
+          },
+        },
+      ],
+    });
   }
 
   await workbook.xlsx.writeFile(outputPath);

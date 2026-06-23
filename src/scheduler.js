@@ -42,7 +42,7 @@ function firstBusinessDayOnOrAfter(date, isHoliday) {
  * タスク一覧をスケジューリングする。
  *
  * @param {Array} tasks - [{ name, assignee, days, priority, progress, ...other }]
- * @param {Date} projectStart - プロジェクト全体の開始日
+ * @param {Map<string, Date>} assigneeStartDates - 担当者名 -> 参画開始日
  * @param {function} isHoliday - 日付を受け取り休日かどうかを返す関数
  * @returns {Array} スケジュール結果 [{ ...task, startDate, endDate, progress }]
  *   (Bファイルの行順をそのまま保持して返す)
@@ -50,13 +50,13 @@ function firstBusinessDayOnOrAfter(date, isHoliday) {
  * ルール:
  * - 依存関係はなし。
  * - 日程計算は優先順位(数値が小さいほど優先、同値は入力順)の順に行う。
- * - 各タスクは「projectStart」と「その担当者が空く最初の営業日」の
- *   うち遅い方から開始する。
+ * - 各タスクは「その担当者の参画開始日」と「その担当者が空く最初の営業日」の
+ *   うち遅い方から開始する(参画開始日より前には着手しない)。
  * - 同一担当者のタスクは重複しない(直列)。別担当者は並行可能。
  * - 進捗は常に保持する(未入力は0%扱い)。
  * - 戻り値の並び順は、計算順(優先順位順)ではなく、常にBファイルの行順(入力順)。
  */
-function scheduleTasks(tasks, projectStart, isHoliday) {
+function scheduleTasks(tasks, assigneeStartDates, isHoliday) {
   // 優先順位でソート (小さい数字が先。未指定/NaNは最後、入力順を保持する安定ソート)
   const indexed = tasks.map((t, i) => ({ t, i }));
   indexed.sort((a, b) => {
@@ -66,25 +66,31 @@ function scheduleTasks(tasks, projectStart, isHoliday) {
     return a.i - b.i; // 同順位は入力順
   });
 
-  const projectStartBusiness = firstBusinessDayOnOrAfter(projectStart, isHoliday);
-
-  // 担当者ごとの「次に空く日」を管理
+  // 担当者ごとの「次に空く日」を管理。初期値は各担当者の参画開始日。
   const assigneeNextAvailable = new Map();
 
   const results = [];
   for (const { t, i } of indexed) {
-    const assignee = (t.assignee || '(未割当)').toString();
+    const assignee = (t.assignee || '').toString().trim();
     const days = Number(t.days);
     if (!Number.isFinite(days) || days <= 0) {
       throw new Error(`タスク「${t.name}」の工数(日)が不正です: ${t.days}`);
     }
 
+    const assigneeStart = assigneeStartDates.get(assignee);
+    if (!assigneeStart) {
+      // readBFile側で事前チェックしているはずだが、直接scheduleTasksを呼ぶ
+      // ケースのために二重に防御する。
+      throw new Error(`担当者「${assignee}」の参画開始日が「担当者」シートに見つかりません。`);
+    }
+    const assigneeStartBusiness = firstBusinessDayOnOrAfter(assigneeStart, isHoliday);
+
     const assigneeFree = assigneeNextAvailable.has(assignee)
       ? assigneeNextAvailable.get(assignee)
-      : projectStartBusiness;
+      : assigneeStartBusiness;
 
-    // プロジェクト開始日と担当者の空き日、どちらか遅い方
-    let candidateStart = assigneeFree > projectStartBusiness ? assigneeFree : projectStartBusiness;
+    // 担当者の参画開始日と、その担当者の直近の空き日、どちらか遅い方
+    let candidateStart = assigneeFree > assigneeStartBusiness ? assigneeFree : assigneeStartBusiness;
     candidateStart = firstBusinessDayOnOrAfter(candidateStart, isHoliday);
 
     const endDate = addBusinessDays(candidateStart, days, isHoliday);

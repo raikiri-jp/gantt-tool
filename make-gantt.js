@@ -4,8 +4,8 @@ const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
 
-const { loadHolidays, makeIsHoliday } = require('./src/holidays');
-const { readTasksFromExcel } = require('./src/readTasks');
+const { loadHolidays, makeIsHoliday, buildYearEndHolidayList } = require('./src/holidays');
+const { readBFile } = require('./src/readTasks');
 const { scheduleTasks } = require('./src/scheduler');
 const { buildGanttExcel } = require('./src/buildGantt');
 
@@ -24,20 +24,6 @@ function ask(rl, promptText) {
   });
 }
 
-function parseDateInput(str) {
-  const s = str.trim();
-  // YYYY-MM-DD or YYYY/MM/DD or YYYYMMDD
-  let m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
-  if (!m) m = s.match(/^(\d{4})(\d{2})(\d{2})$/);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  const date = new Date(y, mo - 1, d);
-  if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d) return null;
-  return date;
-}
-
 function todayDate() {
   const now = new Date();
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -54,14 +40,12 @@ function timestampForFilename() {
 
 function parseArgs(argv) {
   // 使い方:
-  //   node make-gantt.js <Bファイル.xlsx> [--start YYYY-MM-DD] [--granularity day|week]
+  //   node make-gantt.js <Bファイル.xlsx> [--granularity day|week]
   const positional = [];
   const opts = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--start' || a === '-s') {
-      opts.start = argv[++i];
-    } else if (a === '--granularity' || a === '-g') {
+    if (a === '--granularity' || a === '-g') {
       opts.granularity = argv[++i];
     } else if (a === '--help' || a === '-h') {
       opts.help = true;
@@ -76,9 +60,11 @@ async function main() {
   const { positional, opts } = parseArgs(process.argv.slice(2));
 
   if (opts.help || positional.length < 1) {
-    console.log('使い方: node make-gantt.js <Bファイルのパス(.xlsx)> [--start YYYY-MM-DD] [--granularity day|week]');
-    console.log('  --start, -s         プロジェクト開始日 (省略時は対話入力。さらに省略すると今日)');
+    console.log('使い方: node make-gantt.js <Bファイルのパス(.xlsx)> [--granularity day|week]');
     console.log('  --granularity, -g   day(日単位) または week(週単位) (省略時は対話入力。さらに省略するとweek)');
+    console.log('');
+    console.log('注: プロジェクト全体の開始日は指定しません。各タスクの開始日は');
+    console.log('    Bファイル内の「担当者」シートに記載された各担当者の参画開始日から計算されます。');
     process.exit(positional.length < 1 ? 1 : 0);
   }
   const inputPath = positional[0];
@@ -94,35 +80,6 @@ async function main() {
   const rl = isInteractive
     ? readline.createInterface({ input: process.stdin, output: process.stdout })
     : null;
-
-  // --- 開始日の決定 ---
-  let projectStart = null;
-  if (opts.start !== undefined) {
-    projectStart = parseDateInput(opts.start);
-    if (!projectStart) {
-      console.error(`--start の日付形式が正しくありません: ${opts.start} (例: 2026-06-20)`);
-      process.exit(1);
-    }
-  } else if (isInteractive) {
-    while (!projectStart) {
-      const input = await ask(
-        rl,
-        'プロジェクト全体の開始日を入力してください (例: 2026-06-20、何も入力しないと今日): '
-      );
-      if (input.trim() === '') {
-        projectStart = todayDate();
-        break;
-      }
-      projectStart = parseDateInput(input);
-      if (!projectStart) {
-        console.log('日付の形式が正しくありません。YYYY-MM-DD の形式で入力してください。');
-      }
-    }
-  } else {
-    projectStart = todayDate();
-    console.log('(非対話実行のため開始日は今日を使用します。--start で指定できます)');
-  }
-  console.log(`開始日: ${projectStart.getFullYear()}/${projectStart.getMonth() + 1}/${projectStart.getDate()}`);
 
   // --- 粒度の決定 ---
   let granularity = null;
@@ -157,7 +114,7 @@ async function main() {
 
   if (rl) rl.close();
 
-  // --- 祝日データのロード ---
+  // --- 祝日データのロード(内閣府祝日+年末年始。会社独自の休日はBファイルの「休日」シートから) ---
   let holidayInfo;
   try {
     holidayInfo = await loadHolidays();
@@ -170,28 +127,55 @@ async function main() {
   }
   const isHoliday = makeIsHoliday(holidayInfo.dateSet);
 
-  // --- タスク読み込み ---
-  let taskData;
+  // --- Bファイルの読み込み(タスク一覧・担当者シート・休日シート) ---
+  let bData;
   try {
-    taskData = await readTasksFromExcel(inputPath);
+    bData = await readBFile(inputPath);
   } catch (err) {
     console.error('\nエラー: ' + err.message);
     process.exit(1);
   }
-  const { tasks, columnOrder, hasProgressColumn } = taskData;
+  const { tasks, columnOrder, hasProgressColumn, assigneeStartDates, holidaySheetRows } = bData;
   console.log(`タスクを${tasks.length}件読み込みました。`);
+  console.log(`担当者を${assigneeStartDates.size}名読み込みました。`);
   if (!hasProgressColumn) {
     console.log('(「進捗」列が見つからなかったため、全タスク進捗0%として出力します)');
   }
 
   // --- スケジューリング ---
-  const today = todayDate();
   let scheduled;
   try {
-    scheduled = scheduleTasks(tasks, projectStart, isHoliday);
+    scheduled = scheduleTasks(tasks, assigneeStartDates, isHoliday);
   } catch (err) {
     console.error('\nエラー: ' + err.message);
     process.exit(1);
+  }
+
+  // --- 休日シートに書き出す一覧を組み立てる ---
+  // 内閣府の祝日キャッシュ(名称付き) + 年末年始休暇(タイムライン表示期間をカバーする範囲)
+  // + Bファイルに既に「休日」シートがあった場合はその内容(会社独自の休日など)を引き継ぐ。
+  const minStart = scheduled.reduce((min, t) => (t.startDate < min ? t.startDate : min), scheduled[0].startDate);
+  const maxEnd = scheduled.reduce((max, t) => (t.endDate > max ? t.endDate : max), scheduled[0].endDate);
+  // 年末年始は表示範囲より広めに(前後1年)生成しておけば、カレンダー拡張後の範囲もカバーできる。
+  const yearEndRangeStart = new Date(minStart.getFullYear() - 1, 0, 1);
+  const yearEndRangeEnd = new Date(maxEnd.getFullYear() + 1, 11, 31);
+  const yearEndList = buildYearEndHolidayList(yearEndRangeStart, yearEndRangeEnd);
+
+  const holidayRows = [
+    ...holidayInfo.holidayList.map((h) => ({ date: parseYmd(h.date), name: h.name })),
+    ...yearEndList.map((h) => ({ date: parseYmd(h.date), name: h.name })),
+    ...(holidaySheetRows || []),
+  ];
+  // 同日重複を除去する(祝日キャッシュと年末年始が重なるケースなどがあるため)。
+  // 会社独自の休日(Bの休日シートに元からあったもの)は名称が異なる可能性があるため、
+  // 「同じ日付・同じ名称」の完全重複のみ除去する。
+  const seenKeys = new Set();
+  const dedupedHolidayRows = [];
+  for (const h of holidayRows) {
+    const key = `${h.date.getFullYear()}-${h.date.getMonth()}-${h.date.getDate()}|${h.name}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    dedupedHolidayRows.push(h);
   }
 
   // --- 出力 ---
@@ -205,12 +189,11 @@ async function main() {
 
   await buildGanttExcel(scheduled, {
     granularity,
-    isHoliday,
     outputPath,
-    projectStart,
-    today,
     columnOrder,
     hasProgressColumn,
+    holidayRows: dedupedHolidayRows,
+    assigneeStartDates,
   });
 
   console.log('\n=== 完了 ===');
@@ -221,6 +204,11 @@ async function main() {
     const e = `${t.endDate.getFullYear()}/${t.endDate.getMonth() + 1}/${t.endDate.getDate()}`;
     console.log(`  [${t.assignee}] ${t.name} (${t.days}日, 進捗${t.progress}%): ${s} 〜 ${e}`);
   }
+}
+
+function parseYmd(ymd) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  return new Date(y, m - 1, d);
 }
 
 main().catch((err) => {
